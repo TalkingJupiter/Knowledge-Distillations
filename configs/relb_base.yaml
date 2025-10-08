@@ -1,0 +1,21 @@
+### Relation Based KD Settings
+#   Author: Batuhan Sencer
+#   Institute: Texas Tech University
+#   
+#   IMPORTANT: This code is designed and tested on REPACSS servers. If you need to test or use it you may need to modify the code.
+
+student: Qwen2.5-1.5B-Instruct
+seq_len: 8192
+pack_sequences: true
+data_path: data/relb_embeds/*.parquet
+relb:
+  pool: mean
+  pairs_per_sample: 0
+  triplets_per_sample: 0
+  lambda_dist: 1.0
+  lambda_angle: 0.5
+lora:
+  r: 16
+  alpha: 32
+optimizer:
+  lr: 1e-4

@@ -1,0 +1,20 @@
+{
+    "train_micro_batch_size_per_gpu": 2,
+    "gradient_accumulation_steps": 8,
+    "zero_optimization": {
+        "stage": 3,
+        "reduce_bucket_size": 300000000,
+        "contiguous_gradients": true,
+        "overlap_comm": true,
+        "offload_param": {
+            "device": "none"
+        },
+        "offload_optimizer": {
+            "device": "none"
+        }
+    },
+    "bf16": {
+        "enabled": true
+    },
+    "gradient_clipping": 1.0
+}

@@ -1,0 +1,19 @@
+### Response Based KD Settings
+#   Author: Batuhan Sencer
+#   Institute: Texas Tech University
+#   
+#   IMPORTANT: This code is designed and tested on REPACSS servers. If you need to test or use it you may need to modify the code.
+
+student: Qwen2.5-1.5B-Instruct
+seq_len: 8192
+pack_sequences: true
+data_path: data/topk_k16/*.parquet
+rb:
+  topk: 16
+  temperature: 2.0
+  alpha: 0.9
+lora:
+  r: 16
+  alpha: 32
+optimizer:
+  lr: 1e-4

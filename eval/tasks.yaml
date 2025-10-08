@@ -1,0 +1,13 @@
+tasks:
+  - name: mmlu
+    desc: Multitask reasoning (57 tasks)
+  - name: gsm8k
+    desc: Math word problems
+  - name: arc_challenge
+    desc: Commonsense QA (hard split)
+  - name: truthfulqa
+    desc: Hallucination robustness
+  - name: hellaswag
+    desc: Commonsense NLI
+  - name: bbh
+    desc: BigBench Hard tasks
