@@ -19,6 +19,7 @@ sentencepiece>=0.1.99
 pyyaml>=6.0
 
 # Monitoring
+nvidia-ml-py
 pynvml>=11.0.0
 psutil>=5.9.0
 
