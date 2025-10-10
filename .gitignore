@@ -1,19 +1,33 @@
-.venv
-logs/
-machinefile*
-shards.jsonl
+# ============================
+#   Environment & Caches
+# ============================
+.venv/
+__pycache__/
 serialization_dir/
-results/*.json
 fb_hints_L22/
 relb_embeds/
 topk_k16/
-__pycache__/
-plots/
+
+# ============================
+#   Logs & Outputs
+# ============================
+logs/
 out/
+plots/
+figures/
+results/
+machinefile*
+
+# ============================
+#   Data Artifacts
+# ============================
+*.jsonl
 *.json
 *.csv
-figures/
-csvconv.py
-plotter2.py
+*.gz
+*.txt
+
+# ============================
+#   Scripts & Temporary Files
+# ============================
 *.out
-kd_minmax_summary.py
