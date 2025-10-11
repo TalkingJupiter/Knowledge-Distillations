@@ -122,14 +122,30 @@ def load_one(spec: str, default_split: str, cache_dir: Optional[str], streaming:
     kwargs = {}
     if cache_dir: kwargs["cache_dir"] = cache_dir
     if data_dir:  kwargs["data_dir"]  = data_dir
+
+    # Always trust remote dataset code (Wikipedia, MultiWOZ, etc.)
+    kwargs["trust_remote_code"] = True
+
     try:
-        return load_dataset(base, cfg, split=split, streaming=streaming, **kwargs)
+        ds = load_dataset(base, cfg, split=split, streaming=streaming, **kwargs)
+        # IMPORTANT: for streaming datasets with complex schemas, force Python dicts (bypass Arrow casting)
+        if streaming:
+            ds = ds.with_format("python")
+        return ds
     except Exception as e:
-        offline = str(os.environ.get("HF_DATASETS_OFFLINE", "0")).lower() in ("1", "true", "yes")
-        msg = f"[ERROR] Failed to load dataset '{spec}' (split='{split}', streaming={streaming})."
-        if offline:
-            msg += " HF_DATASETS_OFFLINE=1 is set and this dataset/config/split may not be in the local cache."
-        raise RuntimeError(msg) from e
+        # If streaming failed due to Arrow/format issues, try non-streaming just for this dataset
+        msg = f"[WARN] primary load failed for '{spec}' (streaming={streaming}); attempting non-streaming fallback: {e}"
+        print(msg, file=sys.stderr, flush=True)
+        try:
+            ds = load_dataset(base, cfg, split=split, streaming=False, **kwargs)
+            return ds
+        except Exception as e2:
+            offline = str(os.environ.get("HF_DATASETS_OFFLINE", "0")).lower() in ("1", "true", "yes")
+            final = f"[ERROR] Failed to load dataset '{spec}' (split='{split}')."
+            if offline:
+                final += " HF_DATASETS_OFFLINE=1 may prevent downloads; ensure cache/mirror is present."
+            raise RuntimeError(final) from e2
+
 
 # ============== Main ==============
 def main():

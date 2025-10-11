@@ -31,7 +31,7 @@ def load_student(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        dtype=dtype,                 # (was torch_dtype=)
+        torch_dtype=dtype,                 # (was dtype=dtype)
         trust_remote_code=True,
     )
 
