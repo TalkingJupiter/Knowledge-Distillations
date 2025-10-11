@@ -6,7 +6,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import pyarrow as pa, pyarrow.parquet as pq
 from tqdm import tqdm
-
+from contextlib import nullcontext
 
 # ---------------------------------------------------------------------------------------------------------------
 # Utils
@@ -31,7 +31,6 @@ def iter_json_texts(path: str) -> Iterable[str]:
                 yield t
 
 def l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    # x: [*, d]
     return x / (x.norm(dim=-1, keepdim=True).clamp_min(eps))
 
 def existing_shards(out_dir: str, stem: str) -> List[str]:
@@ -41,7 +40,6 @@ def existing_shards(out_dir: str, stem: str) -> List[str]:
     return sorted(str(x) for x in p.glob(f"{stem}_*.parquet"))
 
 def next_shard_index(out_dir: str, stem: str) -> int:
-    # Find next index based on existing files
     idx = -1
     for fp in existing_shards(out_dir, stem):
         base = os.path.basename(fp)
@@ -61,7 +59,7 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--input_jsonl", required=True)
     ap.add_argument("--out_dir", required=True)
-    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--batch_size", type=int, default=1)  # safer default for VRAM
     ap.add_argument("--max_length", type=int, default=8192)
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     ap.add_argument("--device_map", default="auto", help="e.g., 'auto', 'cuda:0', 'balanced_low_0'")
@@ -87,18 +85,31 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    if tok.padding_side != "left":
-        tok.padding_side = "right" 
+    # Keep right-padding so last_token pooling works as expected
+    if tok.padding_side != "right":
+        tok.padding_side = "right"
 
-    # Model
+    # Model (let HF/Accelerate place across GPUs if device_map is auto/balanced)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch_dtype,
         device_map=args.device_map,
+        low_cpu_mem_usage=True,
     )
     model.eval()
 
-    # Stable Output schema 
+    # Helper: keep inputs on CPU if using HF sharding; otherwise send to model device
+    def place_inputs(enc: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        dm = str(args.device_map)
+        if dm in ("auto", "balanced", "balanced_low_0") or "auto" in dm or "balanced" in dm:
+            return enc  # dispatcher will scatter
+        dev = next(model.parameters()).device
+        return {k: v.to(dev, non_blocking=True) for k, v in enc.items()}
+
+    # AMP autocast for lower activation memory
+    autocast_ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+
+    # Stable Output schema
     schema = pa.schema([
         pa.field("input_ids", pa.list_(pa.int32())),
         pa.field("attn_mask", pa.list_(pa.int8())),
@@ -106,7 +117,7 @@ def main():
         pa.field("length", pa.int32()),
     ])
 
-    # Resume Shard index 
+    # Resume Shard index
     shard_idx = next_shard_index(args.out_dir, args.stem) if args.resume else 0
 
     # Buffers
@@ -136,11 +147,14 @@ def main():
             if len(batch) < args.batch_size:
                 continue
 
-            enc = tok(batch, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt")
-            enc = {k: v.to(model.device) for k, v in enc.items()}
+            enc = tok(batch, padding=True, truncation=True,
+                      max_length=args.max_length, return_tensors="pt")
+            enc = place_inputs(enc)
 
-            out = model(**enc, output_hidden_states=True, use_cache=False)
-            last_hidden: torch.Tensor = out.hidden_states[-1]  # [B, T, d]
+            with autocast_ctx:
+                out = model(**enc, output_hidden_states=False, use_cache=False)
+            last_hidden: torch.Tensor = out.last_hidden_state  # [B, T, d]
+
             attn: torch.Tensor = enc["attention_mask"]         # [B, T]
             ids: torch.Tensor = enc["input_ids"]               # [B, T]
 
@@ -151,19 +165,23 @@ def main():
                 counts = mask.sum(dim=1).clamp_min(1)          # [B, 1]
                 pooled = summed / counts
             elif args.pooling == "cls_last":
-                # First token representation (often BOS/CLS in instruct models)
                 pooled = last_hidden[:, 0, :]
             else:  # last_token
-                # index last non-pad token per row
                 lengths = attn.sum(dim=1).to(torch.long) - 1   # [B]
                 pooled = last_hidden[torch.arange(last_hidden.size(0), device=last_hidden.device), lengths, :]
 
             if args.normalize:
                 pooled = l2_normalize(pooled)
 
-            pooled_cpu = pooled.to(torch.float32).cpu()         # storing as float32 for downstream safety
+            # Move to CPU immediately and free GPU tensors
+            pooled_cpu = pooled.to(torch.float32).cpu()
             attn_cpu = attn.cpu()
             ids_cpu = ids.cpu()
+
+            # Hard frees to reduce peak VRAM
+            del out, last_hidden, pooled
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             B = pooled_cpu.size(0)
             for b in range(B):
@@ -183,10 +201,13 @@ def main():
 
         # tail
         if batch:
-            enc = tok(batch, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt")
-            enc = {k: v.to(model.device) for k, v in enc.items()}
-            out = model(**enc, output_hidden_states=True, use_cache=False)
-            last_hidden = out.hidden_states[-1]
+            enc = tok(batch, padding=True, truncation=True,
+                      max_length=args.max_length, return_tensors="pt")
+            enc = place_inputs(enc)
+
+            with autocast_ctx:
+                out = model(**enc, output_hidden_states=False, use_cache=False)
+            last_hidden = out.last_hidden_state
             attn = enc["attention_mask"]
             ids = enc["input_ids"]
 
@@ -207,6 +228,11 @@ def main():
             pooled_cpu = pooled.to(torch.float32).cpu()
             attn_cpu = attn.cpu()
             ids_cpu = ids.cpu()
+
+            del out, last_hidden, pooled
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             B = pooled_cpu.size(0)
             for b in range(B):
                 L = int(attn_cpu[b].sum().item())
