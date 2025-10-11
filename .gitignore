@@ -31,3 +31,4 @@ machinefile*
 #   Scripts & Temporary Files
 # ============================
 *.out
+docs/
