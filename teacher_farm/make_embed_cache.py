@@ -3,7 +3,7 @@ import argparse, os, json, math, gzip, time, sys, pathlib
 from typing import Iterable, Dict, Any, List, Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 import pyarrow as pa, pyarrow.parquet as pq
 from tqdm import tqdm
 from contextlib import nullcontext
@@ -90,7 +90,7 @@ def main():
         tok.padding_side = "right"
 
     # Model (let HF/Accelerate place across GPUs if device_map is auto/balanced)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModel.from_pretrained(
         args.model,
         torch_dtype=torch_dtype,
         device_map=args.device_map,
