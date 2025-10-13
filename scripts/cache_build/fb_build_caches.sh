@@ -4,6 +4,8 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --partition=h100
 #SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64GB
 #SBATCH --signal=B:SIGUSR1@300
 #SBATCH --requeue
 #SBATCH --output=logs/cache/fb/%x_%j.out
