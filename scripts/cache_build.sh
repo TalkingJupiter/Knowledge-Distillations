@@ -20,8 +20,9 @@ for f in scripts/cache_build/rb_build_caches.sh \
          scripts/cache_build/relb_build_caches.sh \
          data/shards_research_10M.jsonl
 do
-  [[ -x "$f" ]] || { echo "[ERROR] Missing or non-executable: $f" >&2; exit 1; }
+  [[ -e "$f" ]] || { echo "[ERROR] Missing file: $f" >&2; exit 1; }
 done
+
 
 # ---- Submit each KD mode ----
 RB=$(sbatch --parsable scripts/cache_build/rb_build_caches.sh)
