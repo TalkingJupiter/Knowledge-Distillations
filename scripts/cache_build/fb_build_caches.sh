@@ -12,7 +12,7 @@
 #SBATCH --error=logs/cache/fb/%x_%j.err
 
 set -euo pipefail
-# set -x   # <- uncomment for very chatty bash debug
+# set -x   # uncomment for very chatty bash debug
 
 # ---------- Environment ----------
 source scripts/_env_single_node.sh
@@ -22,6 +22,7 @@ export HF_HOME="${HF_HOME:-$SCRATCH/hf}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/models}"
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
+export PYTHONUNBUFFERED=1
 
 # NCCL/torch sane defaults for H100
 export NCCL_P2P_DISABLE=0
@@ -42,13 +43,13 @@ DEVICE_MAP=${DEVICE_MAP:-auto}
 
 # FB hidden-state caches
 FB_DIR=${FB_DIR:-data/fb_hints_L22}
-FB_LAYERS=${FB_LAYERS:-22}           # "22" or "12 22" supported by the script
+FB_LAYERS=${FB_LAYERS:-22}            # e.g. "22" or "12 22"
 FB_BATCH_SIZE=${FB_BATCH_SIZE:-1}
 FB_MAXLEN=${FB_MAXLEN:-2048}
 FB_DTYPE=${FB_DTYPE:-bfloat16}
-FB_FLUSH_EVERY=${FB_FLUSH_EVERY:-256}
+FB_FLUSH_EVERY=${FB_FLUSH_EVERY:-256} # smaller = less loss on preemption
 FB_STEM=${FB_STEM:-fb_hints}
-FB_RESUME=${FB_RESUME:-1}
+FB_CKPT_EVERY=${FB_CKPT_EVERY:-512}   # heartbeat checkpoint frequency
 
 # ---------- Decide model source (local vs HF) ----------
 choose_model_src() {
@@ -59,27 +60,23 @@ choose_model_src() {
 MODEL_SRC="$(choose_model_src "$TEACHER_LOCAL")"
 if [[ "$MODEL_SRC" == "local" ]]; then
   TEACHER="$TEACHER_LOCAL"
-  # Force fully offline for model loads
   export HF_HUB_OFFLINE=1
   export TRANSFORMERS_OFFLINE=1
-  # Keep datasets offline by default (set to 0 if you need to fetch datasets)
   export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
   echo "[INFO] Using LOCAL model: $TEACHER"
 else
   TEACHER="$TEACHER_HF"
-  # Allow online model fetch (ensure token for gated repos)
   export HF_HUB_OFFLINE=0
   export TRANSFORMERS_OFFLINE=0
-  # Datasets remain offline by default; set to 0 if you need to download them
   export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
-  export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"   # faster downloads
+  export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
   echo "[INFO] Using HF model repo: $TEACHER"
   if [[ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
-    echo "[WARN] HUGGING_FACE_HUB_TOKEN not set; gated repos will fail to download."
+    echo "[WARN] HUGGING_FACE_HUB_TOKEN not set; gated repos may fail."
   fi
 fi
 
-# Trust remote dataset loaders when needed (e.g., wikipedia, multi_woz, etc.)
+# Trust remote dataset loaders when needed
 export HF_DATASETS_TRUST_REMOTE_CODE="${HF_DATASETS_TRUST_REMOTE_CODE:-1}"
 
 echo "[INFO] Input:           $IN"
@@ -91,6 +88,7 @@ echo "[INFO] Offline flags:   HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-?} TRANSFORMERS_O
 # ---------- Preemption trap (SIGUSR1) ----------
 cleanup_and_requeue() {
   echo "[WARN] SIGUSR1 received; graceful stop & requeue…"
+  # Ask Python to stop; auto-resume will pick up next run
   pkill -SIGTERM -P $$ python || true
   sleep 10
   scontrol requeue "$SLURM_JOB_ID" || true
@@ -111,6 +109,7 @@ echo "[INFO] nvidia-smi:"
 nvidia-smi || true
 
 # ---------- Run FB hidden-state cache build ----------
+# (Script now supports auto-resume + heartbeat checkpoints via --ckpt_every)
 python teacher_farm/make_hidden_cache.py \
   --model "$TEACHER" \
   --input_jsonl "$IN" \
@@ -122,6 +121,6 @@ python teacher_farm/make_hidden_cache.py \
   --device_map "$DEVICE_MAP" \
   --flush_every "$FB_FLUSH_EVERY" \
   --stem "$FB_STEM" \
-  $( [[ "$FB_RESUME" == "1" ]] && echo --resume )
+  --ckpt_every "$FB_CKPT_EVERY"
 
 echo "[INFO] FB cache build complete"

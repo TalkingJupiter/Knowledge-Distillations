@@ -20,6 +20,7 @@ export HF_HOME="${HF_HOME:-$SCRATCH/hf}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/models}"
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
+export PYTHONUNBUFFERED=1
 
 # NCCL/torch sane defaults for H100
 export NCCL_P2P_DISABLE=0
@@ -47,7 +48,7 @@ RELB_POOLING=${RELB_POOLING:-mean}   # mean | cls_last | last_token
 RELB_NORMALIZE=${RELB_NORMALIZE:-1}  # 1 => --normalize
 RELB_SHARD_SIZE=${RELB_SHARD_SIZE:-4096}
 RELB_STEM=${RELB_STEM:-relb_embeds}
-RELB_RESUME=${RELB_RESUME:-1}
+RELB_CKPT_EVERY=${RELB_CKPT_EVERY:-512}
 
 # ---------- Decide model source (local vs HF) ----------
 choose_model_src() {
@@ -58,23 +59,19 @@ choose_model_src() {
 MODEL_SRC="$(choose_model_src "$TEACHER_LOCAL")"
 if [[ "$MODEL_SRC" == "local" ]]; then
   TEACHER="$TEACHER_LOCAL"
-  # Force fully offline for model loads
   export HF_HUB_OFFLINE=1
   export TRANSFORMERS_OFFLINE=1
-  # Keep datasets offline by default (set to 0 if you need to fetch datasets)
   export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
   echo "[INFO] Using LOCAL model: $TEACHER"
 else
   TEACHER="$TEACHER_HF"
-  # Allow online model fetch (ensure token for gated repos)
   export HF_HUB_OFFLINE=0
   export TRANSFORMERS_OFFLINE=0
-  # Datasets remain offline by default; set to 0 if you need to download them
   export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
-  export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"   # faster downloads
+  export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
   echo "[INFO] Using HF model repo: $TEACHER"
   if [[ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
-    echo "[WARN] HUGGING_FACE_HUB_TOKEN not set; gated repos may fail to download."
+    echo "[WARN] HUGGING_FACE_HUB_TOKEN not set; gated repos may fail."
   fi
 fi
 
@@ -122,6 +119,6 @@ python teacher_farm/make_embed_cache.py \
   $( [[ "$RELB_NORMALIZE" == "1" ]] && echo --normalize ) \
   --shard_size "$RELB_SHARD_SIZE" \
   --stem "$RELB_STEM" \
-  $( [[ "$RELB_RESUME" == "1" ]] && echo --resume )
+  --ckpt_every "$RELB_CKPT_EVERY"
 
 echo "[INFO] RelB cache build complete"
