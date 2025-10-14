@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-import argparse, os, json, gzip, gc, pathlib
-from typing import List, Dict, Any, Iterable, Optional
+import argparse, os, json, gzip, gc, pathlib, warnings
+from typing import List, Dict, Any, Iterable, Optional, Iterator
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.utils import logging as hf_logging
 import pyarrow as pa, pyarrow.parquet as pq
+from pyarrow.parquet import ParquetFile
 from tqdm import tqdm
 
+# Quieter logs & warning noise control (optional)
+hf_logging.set_verbosity_warning()
+warnings.simplefilter("ignore", FutureWarning)
+
+# (Optional) speed on A100/H100
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # ----------------------------------------------------------------------------------------------------------------
 # I/O helpers
@@ -40,19 +49,60 @@ def batched(iterable: Iterable[Any], n: int):
     if buf:
         yield buf
 
-def next_shard_index(out_dir: str, stem: str) -> int:
+# ----------------------------------------------------------------------------------------------------------------
+# Resume helpers
+# ----------------------------------------------------------------------------------------------------------------
+def existing_shards(out_dir: str, stem: str) -> List[str]:
     p = pathlib.Path(out_dir)
     if not p.exists():
-        return 0
+        return []
+    return sorted(str(fp) for fp in p.glob(f"{stem}_*.parquet"))
+
+def next_shard_index(out_dir: str, stem: str) -> int:
     idx = -1
-    for fp in p.glob(f"{stem}_*.parquet"):
+    for fp in existing_shards(out_dir, stem):
         try:
-            i = int(fp.stem.split("_")[-1])
+            i = int(pathlib.Path(fp).stem.split("_")[-1])
             idx = max(idx, i)
         except Exception:
             pass
     return idx + 1
 
+def count_rows_in_existing_shards(out_dir: str, stem: str) -> int:
+    total = 0
+    for fp in existing_shards(out_dir, stem):
+        try:
+            pf = ParquetFile(fp)
+            total += pf.metadata.num_rows
+        except Exception:
+            pass
+    return total
+
+def skip_iter(it: Iterator[str], n: int) -> Iterator[str]:
+    for _ in range(n):
+        try:
+            next(it)
+        except StopIteration:
+            return
+    for x in it:
+        yield x
+
+def file_fingerprint(path: str) -> Dict[str, Any]:
+    st = os.stat(path)
+    return {"path": os.path.abspath(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+
+def load_ckpt(ckpt_path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(ckpt_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def save_ckpt(ckpt_path: str, data: Dict[str, Any]) -> None:
+    tmp = ckpt_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, ckpt_path)
 
 # ----------------------------------------------------------------------------------------------------------------
 # Layer resolution
@@ -75,7 +125,6 @@ def resolve_block_list(model) -> List[torch.nn.Module]:
         if hasattr(model, attr) and isinstance(getattr(model, attr), (list, tuple)):
             return list(getattr(model, attr))
     raise RuntimeError("Could not resolve transformer block list for this model.")
-
 
 # ----------------------------------------------------------------------------------------------------------------
 # Main
@@ -100,8 +149,10 @@ def main():
                     help='Write to parquet every N samples.')
     ap.add_argument('--stem', default='fb_hints',
                     help='Output file stem (files like <stem>_000000.parquet).')
-    ap.add_argument('--resume', action='store_true',
-                    help='Resume at next shard index if files exist.')
+
+    # Heartbeat checkpointing (even before first shard)
+    ap.add_argument('--ckpt_every', type=int, default=512,
+                    help='Write a checkpoint every N processed rows (in addition to shard flushes).')
 
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -114,6 +165,39 @@ def main():
     }
     torch_dtype = dmap[args.dtype]
 
+    # --- auto-resume detection
+    ckpt_path = os.path.join(args.out_dir, f"{args.stem}.ckpt.json")
+    input_fp  = file_fingerprint(args.input_jsonl)
+    shard_idx = 0
+    line_start = 0
+    ckpt = load_ckpt(ckpt_path)
+    shards_exist = len(existing_shards(args.out_dir, args.stem)) > 0
+
+    if ckpt and ckpt.get("input_fingerprint") == input_fp:
+        line_start = int(ckpt.get("line_index", 0))
+        shard_idx  = int(ckpt.get("shard_idx", 0))
+        print(f"[RESUME] Using checkpoint: line={line_start}, next_shard={shard_idx}")
+    elif shards_exist:
+        shard_idx  = next_shard_index(args.out_dir, args.stem)
+        line_start = count_rows_in_existing_shards(args.out_dir, args.stem)
+        print(f"[RESUME] No valid checkpoint. Detected {line_start} rows across {shard_idx} shards; skipping that many input lines.")
+    else:
+        print("[START] No shards or checkpoint found; starting from the beginning.")
+
+    # --- startup checkpoint so you always have one, even pre-flush
+    save_ckpt(ckpt_path, {
+        "input_fingerprint": input_fp,
+        "line_index": line_start,
+        "shard_idx": shard_idx,
+        "out_dir": os.path.abspath(args.out_dir),
+        "stem": args.stem,
+        "model": args.model,
+        "dtype": args.dtype,
+        "max_length": args.max_length,
+        "batch_size": args.batch_size,
+        "layers": args.layers,
+    })
+
     # --- tokenizer
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     if tok.pad_token is None:
@@ -124,7 +208,7 @@ def main():
     # --- load teacher (multi-GPU friendly)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,          # use dtype= (torch_dtype is deprecated)
         device_map=args.device_map,
     )
     model.eval()
@@ -153,9 +237,7 @@ def main():
             captured[li] = out.detach().to('cpu')
         return hook
 
-    handles = []
-    for li in target_layers:
-        handles.append(blocks[li].register_forward_hook(make_hook(li)))
+    handles = [blocks[li].register_forward_hook(make_hook(li)) for li in target_layers]
 
     # --- parquet schema (dynamic based on selected layers)
     fields = [
@@ -167,8 +249,8 @@ def main():
         fields.append(pa.field(f'hidden_L{li}', pa.list_(pa.list_(pa.float32()))))
     schema = pa.schema(fields)
 
-    shard_idx = next_shard_index(args.out_dir, args.stem) if args.resume else 0
     rows: List[Dict[str, Any]] = []
+    processed_lines = 0
 
     def flush_rows():
         nonlocal rows, shard_idx
@@ -181,11 +263,29 @@ def main():
         shard_idx += 1
         rows.clear()
         gc.collect()
+        save_ckpt(ckpt_path, {
+            "input_fingerprint": input_fp,
+            "line_index": processed_lines,
+            "shard_idx": shard_idx,
+            "out_dir": os.path.abspath(args.out_dir),
+            "stem": args.stem,
+            "model": args.model,
+            "dtype": args.dtype,
+            "max_length": args.max_length,
+            "batch_size": args.batch_size,
+            "layers": target_layers,
+        })
 
     # --- streaming
     with torch.inference_mode():
         pbar = tqdm(desc="FB cache", unit="rows")
-        for batch in batched(iter_json_texts(args.input_jsonl), args.batch_size):
+
+        text_iter = iter_json_texts(args.input_jsonl)
+        if line_start > 0:
+            text_iter = skip_iter(iter(text_iter), line_start)
+            processed_lines = line_start
+
+        for batch in batched(text_iter, args.batch_size):
             # Tokenize on CPU; HF dispatch handles device placement
             enc = tok(batch, padding=True, truncation=True,
                       max_length=args.max_length, return_tensors='pt')
@@ -211,9 +311,26 @@ def main():
             del enc, input_ids, attn_mask
             captured.clear()
 
-            # free GPU mem from compute graphs
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             pbar.update(B)
+            processed_lines += B
+
+            # heartbeat checkpoint (even if no shard flushed yet)
+            if args.ckpt_every > 0 and (processed_lines % args.ckpt_every) < B:
+                save_ckpt(ckpt_path, {
+                    "input_fingerprint": input_fp,
+                    "line_index": processed_lines,
+                    "shard_idx": shard_idx,  # current next shard index
+                    "out_dir": os.path.abspath(args.out_dir),
+                    "stem": args.stem,
+                    "model": args.model,
+                    "dtype": args.dtype,
+                    "max_length": args.max_length,
+                    "batch_size": args.batch_size,
+                    "layers": target_layers,
+                })
 
             if len(rows) >= args.flush_every:
                 flush_rows()

@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-import argparse, os, json, math, gzip, time, sys, pathlib
-from typing import Iterable, Dict, Any, List, Optional
+import argparse, os, json, math, gzip, time, pathlib, warnings
+from typing import Iterable, Dict, Any, List, Optional, Iterator
 
 import torch
 from transformers import AutoModel, AutoTokenizer
+from transformers.utils import logging as hf_logging
 import pyarrow as pa, pyarrow.parquet as pq
+from pyarrow.parquet import ParquetFile
 from tqdm import tqdm
 from contextlib import nullcontext
+
+# Optional: quieter logs & ignore noisy FutureWarnings
+hf_logging.set_verbosity_warning()
+warnings.simplefilter("ignore", FutureWarning)
+
+# Optional (nice on A100/H100): allow TF32 for faster matmul without hurting inference
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # ---------------------------------------------------------------------------------------------------------------
 # Utils
@@ -50,6 +60,42 @@ def next_shard_index(out_dir: str, stem: str) -> int:
             pass
     return idx + 1
 
+def count_rows_in_existing_shards(out_dir: str, stem: str) -> int:
+    total = 0
+    for fp in existing_shards(out_dir, stem):
+        try:
+            pf = ParquetFile(fp)
+            total += pf.metadata.num_rows
+        except Exception:
+            pass
+    return total
+
+def skip_iter(it: Iterator[str], n: int) -> Iterator[str]:
+    # burn n items, then yield the rest
+    for _ in range(n):
+        try:
+            next(it)
+        except StopIteration:
+            return
+    for x in it:
+        yield x
+
+def file_fingerprint(path: str) -> Dict[str, Any]:
+    st = os.stat(path)
+    return {"path": os.path.abspath(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+
+def load_ckpt(ckpt_path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(ckpt_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def save_ckpt(ckpt_path: str, data: Dict[str, Any]) -> None:
+    tmp = ckpt_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, ckpt_path)
 
 # ---------------------------------------------------------------------------------------------------------------
 # Main
@@ -68,46 +114,86 @@ def main():
     ap.add_argument("--normalize", action="store_true", help="L2-normalize pooled embeddings")
     ap.add_argument("--shard_size", type=int, default=4096, help="Rows per Parquet shard")
     ap.add_argument("--stem", default="relb_embeds", help="Output filename stem")
-    ap.add_argument("--resume", action="store_true", help="Resume by appending after last shard index")
-    args = ap.parse_args()
+    # Heartbeat checkpointing
+    ap.add_argument("--ckpt_every", type=int, default=512,
+                    help="Write a checkpoint every N processed rows (in addition to shard flushes).")
 
+    args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Dtype
-    dtype_map = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }
+    # Checkpoint plumbing
+    ckpt_path = os.path.join(args.out_dir, f"{args.stem}.ckpt.json")
+    input_fp  = file_fingerprint(args.input_jsonl)
+
+    # Auto-detect resume position & shard index
+    shard_idx = 0
+    line_start = 0
+    ckpt = load_ckpt(ckpt_path)
+    shards_exist = len(existing_shards(args.out_dir, args.stem)) > 0
+
+    if ckpt and ckpt.get("input_fingerprint") == input_fp:
+        line_start = int(ckpt.get("line_index", 0))
+        shard_idx  = int(ckpt.get("shard_idx", 0))
+        print(f"[RESUME] Using checkpoint: line={line_start}, next_shard={shard_idx}")
+    elif shards_exist:
+        shard_idx  = next_shard_index(args.out_dir, args.stem)
+        line_start = count_rows_in_existing_shards(args.out_dir, args.stem)
+        print(f"[RESUME] No valid checkpoint. Detected {line_start} rows across {shard_idx} shards; "
+              f"skipping that many input lines.")
+    else:
+        shard_idx = 0
+        line_start = 0
+        print("[START] No shards or checkpoint found; starting from the beginning.")
+
+    # Startup checkpoint so you always have one (even pre-flush)
+    save_ckpt(ckpt_path, {
+        "input_fingerprint": input_fp,
+        "line_index": line_start,
+        "shard_idx": shard_idx,
+        "out_dir": os.path.abspath(args.out_dir),
+        "stem": args.stem,
+        "pooling": args.pooling,
+        "normalize": args.normalize,
+        "model": args.model,
+        "dtype": args.dtype,
+        "max_length": args.max_length,
+        "batch_size": args.batch_size,
+    })
+
+    # Dtype + AMP selection
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
+    amp_dtype = None
+    if torch.cuda.is_available():
+        if args.dtype == "bfloat16":
+            amp_dtype = torch.bfloat16
+        elif args.dtype == "float16":
+            amp_dtype = torch.float16
+    autocast_ctx = (torch.cuda.amp.autocast(dtype=amp_dtype) if amp_dtype is not None else nullcontext())
 
     # Tokenizer
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    # Keep right-padding so last_token pooling works as expected
     if tok.padding_side != "right":
         tok.padding_side = "right"
 
     # Model (let HF/Accelerate place across GPUs if device_map is auto/balanced)
     model = AutoModel.from_pretrained(
         args.model,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,                   # (was torch_dtype=...)
         device_map=args.device_map,
         low_cpu_mem_usage=True,
     )
     model.eval()
 
-    # Helper: keep inputs on CPU if using HF sharding; otherwise send to model device
+    # Keep inputs on CPU if HF dispatcher will scatter; otherwise move to model device
     def place_inputs(enc: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         dm = str(args.device_map)
         if dm in ("auto", "balanced", "balanced_low_0") or "auto" in dm or "balanced" in dm:
-            return enc  # dispatcher will scatter
+            return enc
         dev = next(model.parameters()).device
         return {k: v.to(dev, non_blocking=True) for k, v in enc.items()}
-
-    # AMP autocast for lower activation memory
-    autocast_ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
 
     # Stable Output schema
     schema = pa.schema([
@@ -117,12 +203,10 @@ def main():
         pa.field("length", pa.int32()),
     ])
 
-    # Resume Shard index
-    shard_idx = next_shard_index(args.out_dir, args.stem) if args.resume else 0
-
-    # Buffers
+    # Buffers and counters
     rows: List[Dict[str, Any]] = []
     total_rows = 0
+    processed_lines = 0  # exact number of input lines consumed
     t0 = time.time()
 
     def flush_rows():
@@ -137,12 +221,32 @@ def main():
         rows = []
         shard_idx += 1
 
+        # Write/update checkpoint so future resumes are exact
+        save_ckpt(ckpt_path, {
+            "input_fingerprint": input_fp,
+            "line_index": processed_lines,  # exact lines consumed from input
+            "shard_idx": shard_idx,         # next shard to write
+            "out_dir": os.path.abspath(args.out_dir),
+            "stem": args.stem,
+            "pooling": args.pooling,
+            "normalize": args.normalize,
+            "model": args.model,
+            "dtype": args.dtype,
+            "max_length": args.max_length,
+            "batch_size": args.batch_size,
+        })
+
     # Streaming loop
     with torch.no_grad():
         batch: List[str] = []
         pbar = tqdm(desc="Embedding", unit="rows")
 
-        for text in iter_json_texts(args.input_jsonl):
+        text_iter = iter_json_texts(args.input_jsonl)
+        if line_start > 0:
+            text_iter = skip_iter(iter(text_iter), line_start)
+            processed_lines = line_start
+
+        for text in text_iter:
             batch.append(text)
             if len(batch) < args.batch_size:
                 continue
@@ -178,7 +282,6 @@ def main():
             attn_cpu = attn.cpu()
             ids_cpu = ids.cpu()
 
-            # Hard frees to reduce peak VRAM
             del out, last_hidden, pooled
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -194,7 +297,24 @@ def main():
                 })
 
             pbar.update(B)
+            processed_lines += B
             batch = []
+
+            # heartbeat checkpoint (even if no shard flushed yet)
+            if args.ckpt_every > 0 and (processed_lines % args.ckpt_every) < B:
+                save_ckpt(ckpt_path, {
+                    "input_fingerprint": input_fp,
+                    "line_index": processed_lines,
+                    "shard_idx": shard_idx,  # current next shard index
+                    "out_dir": os.path.abspath(args.out_dir),
+                    "stem": args.stem,
+                    "pooling": args.pooling,
+                    "normalize": args.normalize,
+                    "model": args.model,
+                    "dtype": args.dtype,
+                    "max_length": args.max_length,
+                    "batch_size": args.batch_size,
+                })
 
             if len(rows) >= args.shard_size:
                 flush_rows()
@@ -242,6 +362,7 @@ def main():
                     "pooled_embedding": pooled_cpu[b].tolist(),
                     "length": L,
                 })
+            processed_lines += B
 
         flush_rows()
         pbar.close()
@@ -249,7 +370,6 @@ def main():
     dt = time.time() - t0
     rps = 0.0 if dt <= 0 else total_rows / dt
     print(f"[DONE] rows={total_rows} time={dt:.1f}s rate={rps:.1f} rows/s -> {args.out_dir}")
-
 
 if __name__ == "__main__":
     main()
