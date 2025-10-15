@@ -49,6 +49,7 @@ RELB_NORMALIZE=${RELB_NORMALIZE:-1}  # 1 => --normalize
 RELB_SHARD_SIZE=${RELB_SHARD_SIZE:-4096}
 RELB_STEM=${RELB_STEM:-relb_embeds}
 RELB_CKPT_EVERY=${RELB_CKPT_EVERY:-512}
+MAX_LINES=${MAX_LINES:-500000}
 
 # ---------- Decide model source (local vs HF) ----------
 choose_model_src() {
@@ -119,6 +120,7 @@ python teacher_farm/make_embed_cache.py \
   $( [[ "$RELB_NORMALIZE" == "1" ]] && echo --normalize ) \
   --shard_size "$RELB_SHARD_SIZE" \
   --stem "$RELB_STEM" \
-  --ckpt_every "$RELB_CKPT_EVERY"
+  --ckpt_every "$RELB_CKPT_EVERY" \
+  --max_lines "$MAX_LINES"
 
 echo "[INFO] RelB cache build complete"
