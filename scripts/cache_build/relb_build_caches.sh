@@ -49,7 +49,7 @@ RELB_NORMALIZE=${RELB_NORMALIZE:-1}  # 1 => --normalize
 RELB_SHARD_SIZE=${RELB_SHARD_SIZE:-4096}
 RELB_STEM=${RELB_STEM:-relb_embeds}
 RELB_CKPT_EVERY=${RELB_CKPT_EVERY:-512}
-MAX_LINES=${MAX_LINES:-500000}
+MAX_LINES=${MAX_LINES:-1000000}
 
 # ---------- Decide model source (local vs HF) ----------
 choose_model_src() {

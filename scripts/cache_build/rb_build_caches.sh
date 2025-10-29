@@ -48,6 +48,7 @@ TOPK_MAXLEN=${TOPK_MAXLEN:-8192}
 TOPK_SHARD_SIZE=${TOPK_SHARD_SIZE:-128}
 TOPK_STEM=${TOPK_STEM:-rb_topk}
 TOPK_CKPT_EVERY=${TOPK_CKPT_EVERY:-512}
+MAX_LINES=${MAX_LINES:-1000000}
 
 # ---------- Decide model source (local vs HF) ----------
 choose_model_src() {
@@ -119,6 +120,7 @@ python teacher_farm/make_topk_cache.py \
   --device_map "$DEVICE_MAP" \
   --shard_size "$TOPK_SHARD_SIZE" \
   --stem "$TOPK_STEM" \
-  --ckpt_every "$TOPK_CKPT_EVERY"
+  --ckpt_every "$TOPK_CKPT_EVERY" \
+  --max_lines "$MAX_LINES"
 
 echo "[INFO] RB Cache build complete"

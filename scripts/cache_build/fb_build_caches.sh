@@ -50,6 +50,7 @@ FB_DTYPE=${FB_DTYPE:-bfloat16}
 FB_FLUSH_EVERY=${FB_FLUSH_EVERY:-256} # smaller = less loss on preemption
 FB_STEM=${FB_STEM:-fb_hints}
 FB_CKPT_EVERY=${FB_CKPT_EVERY:-512}   # heartbeat checkpoint frequency
+MAX_LINES=${MAX_LINES:-1000000}
 
 # ---------- Decide model source (local vs HF) ----------
 choose_model_src() {
@@ -121,6 +122,7 @@ python teacher_farm/make_hidden_cache.py \
   --device_map "$DEVICE_MAP" \
   --flush_every "$FB_FLUSH_EVERY" \
   --stem "$FB_STEM" \
-  --ckpt_every "$FB_CKPT_EVERY"
+  --ckpt_every "$FB_CKPT_EVERY" \
+  --max_lines "$MAX_LINES"
 
 echo "[INFO] FB cache build complete"
