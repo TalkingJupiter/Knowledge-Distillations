@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, os, json, gzip, gc, pathlib, math, warnings
+import argparse, os, json, gzip, gc, pathlib, math, warnings, time
 from typing import Iterable, Dict, Any, List, Iterator, Optional
 
 import torch
@@ -129,8 +129,14 @@ def main():
     ap.add_argument('--ckpt_every', type=int, default=512,
                     help='Write a checkpoint every N processed rows (even before first shard).')
 
+    # Absolute cap: stop when total processed lines across all runs reaches this number (0 = unlimited)
+    ap.add_argument('--max_lines', type=int, default=0,
+                    help='Absolute maximum total lines to process overall (0 = no cap).')
+
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+
+    t0 = time.time()
 
     # dtype + AMP
     dtype_map = {'bfloat16': torch.bfloat16, 'float16': torch.float16, 'float32': torch.float32}
@@ -168,6 +174,14 @@ def main():
         print(f"[RESUME] No valid checkpoint. Detected {line_start} rows across {shard_idx} shards; skipping that many input lines.")
     else:
         print("[START] No shards or checkpoint found; starting from the beginning.")
+
+    # absolute cap target
+    lines_target = None
+    if args.max_lines and args.max_lines > 0:
+        lines_target = args.max_lines
+        if line_start >= lines_target:
+            print(f"[EXIT] Already processed {line_start} >= max_lines={args.max_lines}. Nothing to do.")
+            return
 
     # startup checkpoint so you always have one
     save_ckpt(ckpt_path, {
@@ -230,7 +244,12 @@ def main():
         })
 
     with torch.inference_mode():
-        pbar = tqdm(desc="RB top-k", unit="rows")
+        # tqdm total = remaining budget if capped; else indeterminate
+        if args.max_lines and args.max_lines > 0:
+            pbar_total = max(0, args.max_lines - line_start)
+        else:
+            pbar_total = None
+        pbar = tqdm(total=pbar_total, desc="RB top-k", unit="rows")
 
         text_iter = iter_json_texts(args.input_jsonl)
         if line_start > 0:
@@ -238,6 +257,14 @@ def main():
             processed_lines = line_start
 
         for batch_texts in batched(text_iter, args.batch_size):
+            # Respect absolute cap: trim batch if we're about to overshoot
+            if lines_target is not None:
+                remaining = lines_target - processed_lines
+                if remaining <= 0:
+                    break
+                if len(batch_texts) > remaining:
+                    batch_texts = batch_texts[:remaining]
+
             # tokenize on CPU
             enc = tok(batch_texts, padding=True, truncation=True,
                       max_length=args.max_length, return_tensors='pt')
@@ -295,10 +322,18 @@ def main():
             if len(rows) >= args.shard_size:
                 flush_rows()
 
+            if lines_target is not None and processed_lines >= lines_target:
+                break
+
         flush_rows()
         pbar.close()
 
-    print("[DONE] RB top-k cache build ->", args.out_dir)
+    dt = time.time() - t0
+
+    if args.max_lines and args.max_lines > 0 and processed_lines < args.max_lines:
+        print(f"[WARN] Dataset ended early: processed {processed_lines} < max_lines={args.max_lines}")
+
+    print(f"[DONE] RB top-k cache build in {dt:.1f}s -> {args.out_dir}")
 
 
 if __name__ == "__main__":

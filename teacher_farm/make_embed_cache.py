@@ -62,7 +62,7 @@ def next_shard_index(out_dir: str, stem: str) -> int:
 
 def count_rows_in_existing_shards(out_dir: str, stem: str) -> int:
     total = 0
-    for fp in existing_shards(out_dir, stem):
+    for fp in existing_shards(out_dir, args.stem if 'args' in globals() else stem):
         try:
             pf = ParquetFile(fp)
             total += pf.metadata.num_rows
@@ -117,7 +117,11 @@ def main():
     # Heartbeat checkpointing
     ap.add_argument("--ckpt_every", type=int, default=512,
                     help="Write a checkpoint every N processed rows (in addition to shard flushes).")
+    # Absolute cap: stop when total processed lines across all runs reaches this number (0 = unlimited)
+    ap.add_argument("--max_lines", type=int, default=0,
+                    help="Absolute maximum total lines to process overall (0 = no cap).")
 
+    global args  # used in count_rows_in_existing_shards for a tiny convenience
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -144,6 +148,14 @@ def main():
         shard_idx = 0
         line_start = 0
         print("[START] No shards or checkpoint found; starting from the beginning.")
+
+    # Absolute target: stop when total processed lines reaches args.max_lines
+    lines_target = None
+    if args.max_lines and args.max_lines > 0:
+        lines_target = args.max_lines
+        if line_start >= lines_target:
+            print(f"[EXIT] Already processed {line_start} >= max_lines={args.max_lines}. Nothing to do.")
+            return
 
     # Startup checkpoint so you always have one (even pre-flush)
     save_ckpt(ckpt_path, {
@@ -181,7 +193,7 @@ def main():
     # Model (let HF/Accelerate place across GPUs if device_map is auto/balanced)
     model = AutoModel.from_pretrained(
         args.model,
-        dtype=torch_dtype,                   # (was torch_dtype=...)
+        dtype=torch_dtype,
         device_map=args.device_map,
         low_cpu_mem_usage=True,
     )
@@ -239,7 +251,13 @@ def main():
     # Streaming loop
     with torch.no_grad():
         batch: List[str] = []
-        pbar = tqdm(desc="Embedding", unit="rows")
+
+        # tqdm total = remaining budget if capped; else indeterminate
+        if args.max_lines and args.max_lines > 0:
+            pbar_total = max(0, args.max_lines - line_start)
+        else:
+            pbar_total = None
+        pbar = tqdm(total=pbar_total, desc="Embedding", unit="rows")
 
         text_iter = iter_json_texts(args.input_jsonl)
         if line_start > 0:
@@ -247,8 +265,17 @@ def main():
             processed_lines = line_start
 
         for text in text_iter:
+            if lines_target is not None and processed_lines >= lines_target:
+                break
+
             batch.append(text)
-            if len(batch) < args.batch_size:
+            if lines_target is not None:
+                remaining = lines_target - processed_lines
+                if len(batch) > remaining:
+                    batch = batch[:remaining]
+
+            # If we have a cap and the remaining budget is less than batch_size, allow a short final batch.
+            if len(batch) < args.batch_size and (lines_target is None or len(batch) < (lines_target - processed_lines)):
                 continue
 
             enc = tok(batch, padding=True, truncation=True,
@@ -319,56 +346,70 @@ def main():
             if len(rows) >= args.shard_size:
                 flush_rows()
 
+            # Correct stop condition: compare to lines_target
+            if lines_target is not None and processed_lines >= lines_target:
+                break
+
         # tail
         if batch:
-            enc = tok(batch, padding=True, truncation=True,
-                      max_length=args.max_length, return_tensors="pt")
-            enc = place_inputs(enc)
+            if lines_target is not None:
+                remaining = max(0, lines_target - processed_lines)
+                batch = batch[:remaining]
+            if batch:
+                enc = tok(batch, padding=True, truncation=True,
+                          max_length=args.max_length, return_tensors="pt")
+                enc = place_inputs(enc)
 
-            with autocast_ctx:
-                out = model(**enc, output_hidden_states=False, use_cache=False)
-            last_hidden = out.last_hidden_state
-            attn = enc["attention_mask"]
-            ids = enc["input_ids"]
+                with autocast_ctx:
+                    out = model(**enc, output_hidden_states=False, use_cache=False)
+                last_hidden = out.last_hidden_state
+                attn = enc["attention_mask"]
+                ids = enc["input_ids"]
 
-            if args.pooling == "mean":
-                mask = attn.unsqueeze(-1)
-                summed = (last_hidden * mask).sum(dim=1)
-                counts = mask.sum(dim=1).clamp_min(1)
-                pooled = summed / counts
-            elif args.pooling == "cls_last":
-                pooled = last_hidden[:, 0, :]
-            else:
-                lengths = attn.sum(dim=1).to(torch.long) - 1
-                pooled = last_hidden[torch.arange(last_hidden.size(0), device=last_hidden.device), lengths, :]
+                if args.pooling == "mean":
+                    mask = attn.unsqueeze(-1)
+                    summed = (last_hidden * mask).sum(dim=1)
+                    counts = mask.sum(dim=1).clamp_min(1)
+                    pooled = summed / counts
+                elif args.pooling == "cls_last":
+                    pooled = last_hidden[:, 0, :]
+                else:
+                    lengths = attn.sum(dim=1).to(torch.long) - 1
+                    pooled = last_hidden[torch.arange(last_hidden.size(0), device=last_hidden.device), lengths, :]
 
-            if args.normalize:
-                pooled = l2_normalize(pooled)
+                if args.normalize:
+                    pooled = l2_normalize(pooled)
 
-            pooled_cpu = pooled.to(torch.float32).cpu()
-            attn_cpu = attn.cpu()
-            ids_cpu = ids.cpu()
+                pooled_cpu = pooled.to(torch.float32).cpu()
+                attn_cpu = attn.cpu()
+                ids_cpu = ids.cpu()
 
-            del out, last_hidden, pooled
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                del out, last_hidden, pooled
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            B = pooled_cpu.size(0)
-            for b in range(B):
-                L = int(attn_cpu[b].sum().item())
-                rows.append({
-                    "input_ids": ids_cpu[b, :L].to(torch.int32).tolist(),
-                    "attn_mask": attn_cpu[b, :L].to(torch.int8).tolist(),
-                    "pooled_embedding": pooled_cpu[b].tolist(),
-                    "length": L,
-                })
-            processed_lines += B
+                B = pooled_cpu.size(0)
+                for b in range(B):
+                    L = int(attn_cpu[b].sum().item())
+                    rows.append({
+                        "input_ids": ids_cpu[b, :L].to(torch.int32).tolist(),
+                        "attn_mask": attn_cpu[b, :L].to(torch.int8).tolist(),
+                        "pooled_embedding": pooled_cpu[b].tolist(),
+                        "length": L,
+                    })
+                processed_lines += B
+                pbar.update(B)
 
         flush_rows()
         pbar.close()
 
     dt = time.time() - t0
     rps = 0.0 if dt <= 0 else total_rows / dt
+
+    # Optional friendly warning if dataset smaller than target
+    if args.max_lines and args.max_lines > 0 and processed_lines < args.max_lines:
+        print(f"[WARN] Dataset ended early: processed {processed_lines} < max_lines={args.max_lines}")
+
     print(f"[DONE] rows={total_rows} time={dt:.1f}s rate={rps:.1f} rows/s -> {args.out_dir}")
 
 if __name__ == "__main__":
