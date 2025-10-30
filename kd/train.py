@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 # prevent any accidental DeepSpeed path during unwrap/saving
 os.environ.setdefault("ACCELERATE_USE_DEEPSPEED", "false")
@@ -19,6 +20,7 @@ from kd.datasets import (
     collate_rb, collate_pad
 )
 
+
 # ------------------------- Arg parsing -------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -36,7 +38,7 @@ def parse_args():
     ap.add_argument('--batch_size', '--bash_size', dest='batch_size', type=int, default=2)
 
     ap.add_argument('--warmup_steps', type=int, default=100)
-    ap.add_argument('--max_steps', type=int, default=1000)  # <=0 means "no early stop"
+    ap.add_argument('--max_steps', type=int, default=1000, help="<=0 means no early stop")
 
     # RB
     ap.add_argument('--rb.topk', dest='rb_topk', type=int, default=16)
@@ -56,9 +58,12 @@ def parse_args():
     ap.add_argument('--lora.alpha', dest='lora_alpha', type=int, default=32)
 
     # Checkpointing
-    ap.add_argument('--save-dir',   dest='save_dir',   type=str, required=True, help='Root directory to run + checkpoints')
-    ap.add_argument('--save_every', type=int, default=0, help='Steps between checkpoints (0=off)')
-    ap.add_argument('--resume',     type=str, default='auto', choices=['auto','none','path'])
+    ap.add_argument('--save-dir',   dest='save_dir',   type=str, required=True,
+                    help='Root directory to run + checkpoints')
+    ap.add_argument('--save_every', type=int, default=0,
+                    help='Steps between checkpoints (0=off)')
+    ap.add_argument('--resume',     type=str, default='auto',
+                    choices=['auto','none','path'])
     ap.add_argument('--resume_path', type=str, default='')
 
     # Extra checkpoint knobs (optional)
@@ -66,15 +71,20 @@ def parse_args():
                     help='Also checkpoint every N processed files (0=off)')
     return ap.parse_args()
 
+
 # ------------------------- Checkpoint utils -------------------------
 def _latest_ckpt(root: str):
     p = pathlib.Path(root)
-    if not p.exists(): return None
+    if not p.exists():
+        return None
     cks = sorted(p.glob("ckpt_step*"), key=lambda x: x.name)
     return str(cks[-1]) if cks else None
 
+
 def _unwrap_for_save(model: torch.nn.Module) -> torch.nn.Module:
+    # handle Accelerate/DDP wrapping
     return model.module if hasattr(model, "module") else model
+
 
 def _rng_pack():
     return {
@@ -85,6 +95,7 @@ def _rng_pack():
                 if torch.cuda.is_available() else [],
     }
 
+
 def _rng_unpack(st):
     try:
         random.setstate(st["py_random"])
@@ -94,9 +105,12 @@ def _rng_unpack(st):
             for d, s in enumerate(st["cuda"]):
                 torch.cuda.set_rng_state(torch.tensor(s, dtype=torch.uint8), device=d)
     except Exception:
+        # don't kill training if RNG restore fails for some reason
         pass
 
-def _save_ckpt(step, model, tok, optimizer, scheduler, save_dir, dataset=None, projector=None):
+
+def _save_ckpt(step, model, tok, optimizer, scheduler, save_dir,
+               dataset=None, projector=None):
     ck = pathlib.Path(save_dir) / f"ckpt_step{step:07d}"
     ck.mkdir(parents=True, exist_ok=True)
 
@@ -123,7 +137,7 @@ def _save_ckpt(step, model, tok, optimizer, scheduler, save_dir, dataset=None, p
     }
     torch.save(state, ck / "trainer_state.pt")
 
-    # cheap "last" symlink for convenience
+    # cheap "last" symlink
     try:
         tgt = pathlib.Path(save_dir) / "last"
         if tgt.exists() or tgt.is_symlink():
@@ -132,20 +146,26 @@ def _save_ckpt(step, model, tok, optimizer, scheduler, save_dir, dataset=None, p
     except Exception:
         pass
 
-def _load_ckpt(path, model, tok, optimizer, scheduler, dataset=None, projector=None):
+
+def _load_ckpt(path, model, tok, optimizer, scheduler,
+               dataset=None, projector=None):
     from transformers import AutoTokenizer
 
+    # tokenizer pad token recovery
     tok_init = AutoTokenizer.from_pretrained(path, use_fast=True)
     if getattr(tok, "pad_token", None) is None and getattr(tok_init, "pad_token", None) is not None:
         tok.pad_token = tok_init.pad_token
 
+    # model weights / adapters
     base = _unwrap_for_save(model)
     if hasattr(base, "load_adapter"):
+        # PEFT path
         try:
             base.load_adapter(path, "default", is_trainable=True)
         except Exception:
             base.load_adapter(path, is_trainable=True)
     else:
+        # plain HF model path
         try:
             loaded = base.__class__.from_pretrained(path)
             base.load_state_dict(loaded.state_dict(), strict=False)
@@ -161,12 +181,13 @@ def _load_ckpt(path, model, tok, optimizer, scheduler, dataset=None, projector=N
         if "scheduler" in st:
             scheduler.load_state_dict(st["scheduler"])
 
+    # restore iterable dataset cursor / RNG
     if dataset is not None and "dataset" in st and hasattr(dataset, "load_state"):
         dataset.load_state(st["dataset"])
-
     if "rng" in st:
         _rng_unpack(st["rng"])
 
+    # projector weights can be delayed until projector is built
     proj_sd = None
     proj_path = pathlib.Path(path) / "projector.pt"
     if proj_path.exists():
@@ -177,7 +198,12 @@ def _load_ckpt(path, model, tok, optimizer, scheduler, dataset=None, projector=N
 
     return int(st.get("step", 0)), proj_sd
 
+
 def _zero_touch_all_params(model: torch.nn.Module) -> torch.Tensor:
+    """
+    Create a tiny dummy scalar that depends on every param,
+    so DDP buckets all get 'used'. Prevents find_unused_parameters drama.
+    """
     params = [p for p in model.parameters()]
     if not params:
         return torch.zeros((), device='cpu')
@@ -185,6 +211,7 @@ def _zero_touch_all_params(model: torch.nn.Module) -> torch.Tensor:
     for p in params[1:]:
         z = z + p.view(-1)[0] * 0.0
     return z
+
 
 # ------------------------- GC helpers -------------------------
 def _maybe_disable_use_cache(m):
@@ -194,23 +221,37 @@ def _maybe_disable_use_cache(m):
     except Exception:
         pass
 
+
 def _enable_gc_nonreentrant(model) -> bool:
+    """
+    Turn on gradient checkpointing with use_reentrant=False if possible.
+    This avoids the classic LoRA+DDP+reentrant backward death spiral.
+    If we can't do it, we try to disable checkpointing cleanly.
+    """
     _maybe_disable_use_cache(model)
     try:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
         return True
     except Exception:
         pass
+
+    # try common "inner module" attrs
     for attr in ("base_model", "model", "module"):
         base = getattr(model, attr, None)
         if base is None:
             continue
         try:
             _maybe_disable_use_cache(base)
-            base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            base.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
             return True
         except Exception:
             continue
+
+    # if nothing works, make sure it's off instead of half-on
     try:
         if hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
@@ -218,15 +259,18 @@ def _enable_gc_nonreentrant(model) -> bool:
         pass
     return False
 
+
 # ------------------------- Iterable sharder -------------------------
 class _ShardIter(IterableDataset):
     """
-    Wraps an IterableDataset and shards it by global index % world == rank.
-    Keeps an index counter _i so resume can approximately continue.
+    Wrap an IterableDataset and shard it by (global_index % world == rank).
+    Also track a counter so resume() can pick up ~where we left off.
     """
     def __init__(self, ds, rank: int, world: int):
         super().__init__()
-        self.ds, self.rank, self.world = ds, rank, world
+        self.ds = ds
+        self.rank = rank
+        self.world = world
         self._i = 0
 
     def state(self):
@@ -245,17 +289,20 @@ class _ShardIter(IterableDataset):
                 yield item
             self._i += 1
 
+
 # ------------------------- Deterministic workers -------------------------
 def _worker_init_fn(worker_id: int):
     base_seed = torch.initial_seed() % 2**32
     np.random.seed(base_seed + worker_id)
     random.seed(base_seed + worker_id)
 
+
 # ------------------------- Main -------------------------
 def main():
     args = parse_args()
     print(f"[ARGS] {args}")
 
+    # DDP config
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=False,
         static_graph=False,
@@ -270,14 +317,21 @@ def main():
     print(f"[INFO] mixed_precision={accelerator.mixed_precision} world={world} rank={rank}")
     print(f"[INFO] batch_size={args.batch_size} seq_len={args.seq_len}")
 
+    # build student + tokenizer
     model, tok = load_student(args.student, lora_r=args.lora_r, lora_alpha=args.lora_alpha)
 
+    # try to enable non-reentrant gradient checkpointing
     if not _enable_gc_nonreentrant(model):
-        print("[GC] Non-reentrant checkpointing unavailable -> gradient checkpointing disabled for stability.")
+        print("[GC] Non-reentrant checkpointing unavailable -> GC disabled for stability.")
 
+    # optim + sched
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    total_steps_for_sched = max(args.max_steps, 1)  # safe when max_steps<=0
-    scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, total_steps_for_sched)
+    total_steps_for_sched = max(args.max_steps, 1)  # avoid 0 in warmup
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        args.warmup_steps,
+        total_steps_for_sched
+    )
 
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
@@ -285,20 +339,20 @@ def main():
     if args.kd_mode == 'rb':
         dataset = RBTopKIterableDataset(
             args.data,
-            out_dir=os.path.join(args.save_dir, "rb_progress")
+            out_dir=os.path.join(args.save_dir, "rb_progress"),
         )
         collate = collate_rb
     elif args.kd_mode == 'fb':
         dataset = FBDataset(
             args.data,
             teacher_layer=args.fb_teacher_layer,
-            out_dir=os.path.join(args.save_dir, "fb_progress")
+            out_dir=os.path.join(args.save_dir, "fb_progress"),
         )
         collate = collate_pad
     else:  # relb
         dataset = RelBDataset(
             args.data,
-            out_dir=os.path.join(args.save_dir, "relb_progress")
+            out_dir=os.path.join(args.save_dir, "relb_progress"),
         )
         collate = collate_pad
 
@@ -306,9 +360,9 @@ def main():
 
     loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size,  # per-rank batch size
         collate_fn=collate,
-        drop_last=True,
+        drop_last=True,              # keep all ranks same size
         num_workers=1,
         pin_memory=False,
         worker_init_fn=_worker_init_fn,
@@ -341,6 +395,7 @@ def main():
     signal.signal(signal.SIGUSR1, handle_sigusr1)
     signal.signal(signal.SIGTERM, handle_sigusr1)
 
+    # resume logic
     if args.resume == 'auto':
         lp = _latest_ckpt(save_dir)
         if lp:
@@ -371,7 +426,9 @@ def main():
             if args.max_steps > 0 and step >= args.max_steps:
                 break
 
-            # 1. pull CPU batch
+            # -----------------
+            # 1. CPU batch
+            # -----------------
             input_ids = batch['input_ids']
             attn_mask = batch['attn_mask']
 
@@ -380,7 +437,9 @@ def main():
             teacher_feats = batch.get('teacher_feats', None)
             teacher_embed = batch.get('teacher_embed', None)
 
+            # -----------------
             # 2. truncate on CPU
+            # -----------------
             if args.seq_len > 0:
                 S = args.seq_len
 
@@ -396,9 +455,11 @@ def main():
                 elif args.kd_mode == 'fb':
                     if teacher_feats is not None:
                         teacher_feats = teacher_feats[:, :S, :]
-                # relb: teacher_embed is [B,H] already
+                # relb: teacher_embed already [B,H]
 
+            # -----------------
             # 3. move to GPU
+            # -----------------
             input_ids = input_ids.to(device, non_blocking=True)
             attn_mask = attn_mask.to(device, non_blocking=True)
 
@@ -411,7 +472,9 @@ def main():
             if teacher_embed is not None:
                 teacher_embed = teacher_embed.to(device, non_blocking=True)
 
+            # -----------------
             # 4. forward + loss
+            # -----------------
             if args.kd_mode == 'rb':
                 with accelerator.autocast():
                     out = model(
@@ -421,19 +484,24 @@ def main():
                     )
                     s_logits = out.logits[:, :-1, :]  # [B, T-1, V]
 
-                    min_len = min(
-                        s_logits.size(1),
-                        topk_ids.size(1),
-                        topk_logprobs.size(1),
-                    )
-                    kd = response_kd_loss(
-                        s_logits[:, :min_len, :],
-                        topk_ids[:, :min_len, :],
-                        topk_logprobs[:, :min_len, :],
-                        T=args.rb_temperature
-                    )
-                    loss = kd
+                    if topk_ids is None or topk_logprobs is None:
+                        # safety fallback so we don't explode if parquet missing cols
+                        loss = (s_logits.sum() * 0.0)
+                    else:
+                        min_len = min(
+                            s_logits.size(1),
+                            topk_ids.size(1),
+                            topk_logprobs.size(1),
+                        )
+                        kd = response_kd_loss(
+                            s_logits[:, :min_len, :],
+                            topk_ids[:, :min_len, :],
+                            topk_logprobs[:, :min_len, :],
+                            T=args.rb_temperature
+                        )
+                        loss = kd
 
+                # tokens actually predicted (T-1 per row)
                 token_this = (attn_mask.sum() - input_ids.size(0)).item()
 
             elif args.kd_mode == 'fb':
@@ -464,7 +532,8 @@ def main():
                         t_feats = t_feats.to(s_proj.dtype)
 
                     loss = feature_kd_loss(s_proj, t_feats, token_mask=attn_mask)
-                    # anchors to keep graph touching model params
+
+                    # anchors to keep graph touching ALL params & buckets
                     loss = loss + out.logits.mean() * 0.0
                     loss = loss + _zero_touch_all_params(model)
 
@@ -479,33 +548,55 @@ def main():
                         output_hidden_states=True
                     )
 
-                    last = out.hidden_states[-1]        # [B, T, H] (bf16)
-                    mask = attn_mask.unsqueeze(-1)      # [B, T, 1] (long -> broadcast ok)
+                    # last hidden [B, T, H] in bf16 (or mixed precision)
+                    last = out.hidden_states[-1]
 
-                    pooled = (last * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)  # [B, H]
-                    t_emb = teacher_embed  # [B, H]
+                    # do pooling math in float32 to avoid bf16 overflow / NaN
+                    last_f32 = last.float()                    # [B, T, H] fp32
+                    mask_f32 = attn_mask.unsqueeze(-1).float() # [B, T, 1] fp32
 
-                pooled_f32 = pooled.float()
-                t_emb_f32 = t_emb.float()
+                    lengths = mask_f32.sum(dim=1).clamp_min(1.0)     # [B, 1]
+                    pooled = (last_f32 * mask_f32).sum(dim=1) / lengths  # [B, H] fp32
 
-                Bsz = pooled_f32.size(0)
+                # teacher embedding -> fp32
+                t_emb = teacher_embed.float()  # [B, H] fp32
+
+                # clean student pooled BEFORE loss so it can't propagate NaN
+                pooled = torch.nan_to_num(pooled, nan=0.0, posinf=1e4, neginf=-1e4)
+
+                Bsz = pooled.size(0)
+
                 if Bsz < 2:
-                    # not enough samples to form stable pairwise relations
-                    loss = (pooled_f32 * 0).sum()
+                    # can't form pairwise geometry with batch < 2
+                    loss = (pooled * 0).sum()
                 else:
                     loss = relation_kd_loss(
-                        pooled_f32,
-                        t_emb_f32,
+                        pooled,
+                        t_emb,
                         lambda_dist=args.relb_lambda_dist,
                         lambda_angle=args.relb_lambda_angle
                     )
 
-                # sanitize numerics for safety
+                # clamp again just in case relation_kd_loss ever returns inf
                 loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=1e4)
 
                 token_this = attn_mask.sum().item()
 
+                # lightweight debug every ~50 steps, rank0 only
+                if accelerator.is_main_process and (step % 50 == 0):
+                    with torch.no_grad():
+                        s_norm = pooled.norm(dim=1).mean().item()
+                        t_norm = t_emb.norm(dim=1).mean().item()
+                        print(
+                            f"[relb dbg] step={step} Bsz={Bsz} "
+                            f"s_norm={s_norm:.4f} t_norm={t_norm:.4f} "
+                            f"loss_now={loss.item():.8f}"
+                        )
+
+
+            # -----------------
             # 5. backward + step + sched
+            # -----------------
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
 
@@ -516,7 +607,9 @@ def main():
             optimizer.step()
             scheduler.step()
 
+            # -----------------
             # 6. checkpoint during training
+            # -----------------
             if args.save_every > 0 and step > 0 and (step % args.save_every == 0):
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
@@ -527,17 +620,27 @@ def main():
                     print(f"[ckpt] Saved {save_dir}/ckpt_step{step:07d}")
                 accelerator.wait_for_everyone()
 
-            # 7. logging / step book-keeping
+            # -----------------
+            # 7. logging / bookkeeping
+            # -----------------
             total_tokens += token_this
             step += 1
             if accelerator.is_main_process and step % 10 == 0:
                 dt = time.time() - t0
                 tps = total_tokens / max(dt, 1e-6)
-                print(f"[step {step}] loss={loss.item():.4f} tokens={int(total_tokens)} tok/s={tps:.1f}")
+                print(
+                    f"[step {step}] "
+                    f"loss={loss.item():.8f} "
+                    f"tokens={int(total_tokens)} "
+                    f"tok/s={tps:.1f}"
+                )
 
         if args.max_steps > 0 and step >= args.max_steps:
             break
 
+    # -----------------
+    # 8. final save
+    # -----------------
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         pathlib.Path(args.save_dir).mkdir(parents=True, exist_ok=True)
@@ -553,10 +656,12 @@ def main():
         print(f"Saved to {args.save_dir}")
     accelerator.wait_for_everyone()
 
+
 if __name__ == '__main__':
     try:
         main()
     finally:
+        # Try to tear down process group cleanly
         try:
             import torch.distributed as dist
             if dist.is_available() and dist.is_initialized():
